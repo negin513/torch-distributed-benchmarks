@@ -22,13 +22,18 @@ from benchmarks.utils import (
 )
 
 
-def bench(backend, tensor_sizes, warmup, iters, output, local_rank, world_rank, world_size):
+def bench(backend, tensor_sizes, warmup, iters, output, local_rank, world_rank, world_size,
+          use_table=False):
     """Run broadcast benchmark loop (assumes process group is already initialised)."""
+    import statistics
+    from benchmarks.utils import compute_bandwidth
+
+    results = []
     for idx, size in enumerate(tensor_sizes):
         tensor = make_tensor(size, backend, local_rank)
         size_bytes = tensor.element_size() * tensor.numel()
 
-        if world_rank == 0:
+        if world_rank == 0 and not use_table:
             print_benchmark_header(idx, len(tensor_sizes), size, size_bytes, warmup, iters)
 
         warmup_times, bench_times = benchmark_op(
@@ -40,10 +45,24 @@ def bench(backend, tensor_sizes, warmup, iters, output, local_rank, world_rank, 
         )
 
         if world_rank == 0:
-            print_op_result("Broadcast", warmup_times, bench_times,
-                            size_bytes, world_size, "broadcast")
+            if not use_table:
+                print_op_result("Broadcast", warmup_times, bench_times,
+                                size_bytes, world_size, "broadcast")
             log_csv_result(output, backend, "broadcast", world_size,
                            size, size_bytes, warmup_times, bench_times, warmup, iters)
+            if use_table and bench_times:
+                bench_avg = statistics.mean(bench_times)
+                algbw, busbw = compute_bandwidth(size_bytes, bench_avg, world_size, "broadcast")
+                results.append({
+                    "size": size,
+                    "size_bytes": size_bytes,
+                    "warmup_avg": statistics.mean(warmup_times) if warmup_times else 0,
+                    "bench_avg": bench_avg,
+                    "bench_std": statistics.stdev(bench_times) if len(bench_times) > 1 else 0,
+                    "algbw": algbw,
+                    "busbw": busbw,
+                })
+    return results
 
 
 def run(backend, tensor_sizes, warmup, iters, output):

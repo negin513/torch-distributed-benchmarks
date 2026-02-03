@@ -55,13 +55,15 @@ def _ping_pong(tensor, peer, backend):
     return rt
 
 
-def bench(backend, tensor_sizes, warmup, iters, output, local_rank, world_rank, world_size):
+def bench(backend, tensor_sizes, warmup, iters, output, local_rank, world_rank, world_size,
+          use_table=False):
     """Run point-to-point benchmark loop (assumes process group is already initialised)."""
     if world_size < 2:
         if world_rank == 0:
             print("Point-to-point benchmark requires at least 2 ranks. Skipping.")
-        return
+        return []
 
+    results = []
     bench_idx = 0
     total = (world_size - 1) * len(tensor_sizes)
 
@@ -70,7 +72,7 @@ def bench(backend, tensor_sizes, warmup, iters, output, local_rank, world_rank, 
             tensor = make_tensor(size, backend, local_rank)
             size_bytes = tensor.element_size() * tensor.numel()
 
-            if world_rank == 0:
+            if world_rank == 0 and not use_table:
                 print_benchmark_header(bench_idx, total, size, size_bytes, warmup, iters)
                 print(f"  send/recv  rank 0 <-> rank {peer}")
 
@@ -88,23 +90,45 @@ def bench(backend, tensor_sizes, warmup, iters, output, local_rank, world_rank, 
                     bench_times.append(rt)
 
             if world_rank == 0 and bench_times:
+                from benchmarks.utils import _ansi_bw
                 warmup_avg = statistics.mean(warmup_times) if warmup_times else 0
                 bench_avg = statistics.mean(bench_times)
                 bench_std = statistics.stdev(bench_times) if len(bench_times) > 1 else 0
                 half_rt = bench_avg / 2
-                bw = (size_bytes / half_rt / (1024**3)) if half_rt > 0 else float("inf")
+                # P2P: algbw = size / one-way time, busbw = algbw (factor=1)
+                algbw = (size_bytes / half_rt / 1e9) if half_rt > 0 else float("inf")
+                busbw = algbw  # no correction factor for point-to-point
 
-                print(f"{'Send/Recv'.ljust(12)} - Warmup: {warmup_avg:.6f}s, "
-                      f"Benchmark: {bench_avg:.6f}\u00b1{bench_std:.6f}s, "
-                      f"One-way: {half_rt:.6f}s, BW: {bw:.2f} GB/s")
+                if not use_table:
+                    bench_avg_ms = bench_avg * 1e3
+                    bench_std_ms = bench_std * 1e3
+                    half_rt_ms = half_rt * 1e3
+                    print(f"\033[1m{'Send/Recv'.ljust(12)}\033[0m - Warmup: {warmup_avg:.6f}s, "
+                          f"RTT: {bench_avg_ms:.3f}\u00b1{bench_std_ms:.3f}ms, "
+                          f"One-way: {half_rt_ms:.3f}ms, BW: {_ansi_bw(algbw)} GB/s")
 
                 log_csv_result(output, backend, f"send_recv_peer{peer}", world_size,
                                size, size_bytes, warmup_times, bench_times, warmup, iters)
+
+                if use_table:
+                    results.append({
+                        "peer": peer,
+                        "size": size,
+                        "size_bytes": size_bytes,
+                        "warmup_avg": warmup_avg,
+                        "bench_avg": bench_avg,
+                        "bench_std": bench_std,
+                        "half_rt": half_rt,
+                        "algbw": algbw,
+                        "busbw": busbw,
+                    })
 
             bench_idx += 1
 
         # Sync all ranks before moving to the next peer
         dist.barrier()
+
+    return results
 
 
 def run(backend, tensor_sizes, warmup, iters, output):

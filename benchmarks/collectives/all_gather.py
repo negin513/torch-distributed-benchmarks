@@ -23,55 +23,79 @@ from benchmarks.utils import (
 )
 
 
-def bench(backend, tensor_sizes, warmup, iters, output, local_rank, world_rank, world_size):
+def bench(backend, tensor_sizes, warmup, iters, output, local_rank, world_rank, world_size,
+          use_table=False):
     """Run all-gather benchmark loop (assumes process group is already initialised)."""
+    import statistics as _stats
+    from benchmarks.utils import compute_bandwidth
     use_cuda = backend == "nccl"
 
+    results = []
     for idx, size in enumerate(tensor_sizes):
         send_tensor = make_tensor(size, backend, local_rank)
-        size_bytes = send_tensor.element_size() * send_tensor.numel()
+        per_rank_bytes = send_tensor.element_size() * send_tensor.numel()
+        total_elems = size * world_size
+        total_bytes = per_rank_bytes * world_size
+        # Report per-rank input size (the "package" each rank contributes)
+        report_elems = size
+        report_bytes = per_rank_bytes
 
-        # Pre-allocate the gather output list
-        gather_list = [torch.empty_like(send_tensor) for _ in range(world_size)]
+        # Pre-allocate a single contiguous output buffer (matches nccl-tests)
+        device = torch.device("cuda", local_rank) if use_cuda else torch.device("cpu")
+        output_tensor = torch.empty(total_elems, dtype=torch.float32, device=device)
 
-        if world_rank == 0:
-            print_benchmark_header(idx, len(tensor_sizes), size, size_bytes, warmup, iters)
+        if world_rank == 0 and not use_table:
+            print_benchmark_header(idx, len(tensor_sizes), report_elems, report_bytes, warmup, iters)
 
-        # Warmup
-        warmup_times = []
+        # Warmup — tight loop, single sync (nccl-tests style)
+        if use_cuda:
+            torch.cuda.synchronize()
+        dist.barrier()
+        warmup_start = time.perf_counter()
         for _ in range(warmup):
-            if use_cuda:
-                torch.cuda.synchronize()
-            dist.barrier()
-            start = time.perf_counter()
-            dist.all_gather(gather_list, send_tensor.clone())
-            if use_cuda:
-                torch.cuda.synchronize()
-            dist.barrier()
-            elapsed = time.perf_counter() - start
-            if world_rank == 0:
-                warmup_times.append(elapsed)
+            dist.all_gather_into_tensor(output_tensor, send_tensor)
+        if use_cuda:
+            torch.cuda.synchronize()
+        warmup_total = time.perf_counter() - warmup_start
 
-        # Benchmark
-        bench_times = []
+        warmup_times = []
+        if world_rank == 0 and warmup > 0:
+            warmup_times.append(warmup_total / warmup)
+
+        # Benchmark — tight loop, single sync (nccl-tests style)
+        if use_cuda:
+            torch.cuda.synchronize()
+        dist.barrier()
+        bench_start = time.perf_counter()
         for _ in range(iters):
-            if use_cuda:
-                torch.cuda.synchronize()
-            dist.barrier()
-            start = time.perf_counter()
-            dist.all_gather(gather_list, send_tensor.clone())
-            if use_cuda:
-                torch.cuda.synchronize()
-            dist.barrier()
-            elapsed = time.perf_counter() - start
-            if world_rank == 0:
-                bench_times.append(elapsed)
+            dist.all_gather_into_tensor(output_tensor, send_tensor)
+        if use_cuda:
+            torch.cuda.synchronize()
+        bench_total = time.perf_counter() - bench_start
+
+        bench_times = []
+        if world_rank == 0 and iters > 0:
+            bench_times.append(bench_total / iters)
 
         if world_rank == 0:
-            print_op_result("All-gather", warmup_times, bench_times,
-                            size_bytes, world_size, "all_gather")
+            if not use_table:
+                print_op_result("All-gather", warmup_times, bench_times,
+                                total_bytes, world_size, "all_gather")
             log_csv_result(output, backend, "all_gather", world_size,
-                           size, size_bytes, warmup_times, bench_times, warmup, iters)
+                           total_elems, total_bytes, warmup_times, bench_times, warmup, iters)
+            if use_table and bench_times:
+                bench_avg = _stats.mean(bench_times)
+                algbw, busbw = compute_bandwidth(total_bytes, bench_avg, world_size, "all_gather")
+                results.append({
+                    "size": report_elems,
+                    "size_bytes": report_bytes,
+                    "warmup_avg": _stats.mean(warmup_times) if warmup_times else 0,
+                    "bench_avg": bench_avg,
+                    "bench_std": _stats.stdev(bench_times) if len(bench_times) > 1 else 0,
+                    "algbw": algbw,
+                    "busbw": busbw,
+                })
+    return results
 
 
 def run(backend, tensor_sizes, warmup, iters, output):
