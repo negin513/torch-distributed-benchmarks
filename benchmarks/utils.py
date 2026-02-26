@@ -1,8 +1,10 @@
 """Shared utilities for distributed PyTorch benchmarks."""
 
 import os
+import re
 import json
 import socket
+import subprocess
 import time
 import statistics
 import argparse
@@ -19,6 +21,158 @@ try:
     HAS_RICH = True
 except ImportError:
     HAS_RICH = False
+
+
+# ---------------------------------------------------------------------------
+# Lustre striping helpers
+# ---------------------------------------------------------------------------
+
+def get_lustre_stripe_info(path):
+    """Query Lustre stripe settings for *path* via ``lfs getstripe``.
+
+    Handles both simple layouts (single stripe_count/stripe_size) and
+    Progressive File Layouts (PFL) with multiple extent-based components.
+
+    Returns a dict with:
+      - ``stripe_count``, ``stripe_size`` — from the first (or only) component
+      - ``ost_pool`` — pool name or ``None``
+      - ``pfl`` — ``True`` if a Progressive File Layout is detected
+      - ``components`` — list of dicts with ``start``, ``end``,
+        ``stripe_count``, ``stripe_size`` (only present when ``pfl=True``)
+
+    Returns ``None`` when *path* is not on Lustre or ``lfs`` is unavailable.
+    """
+    try:
+        result = subprocess.run(
+            ["lfs", "getstripe", "-d", str(path)],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+        out = result.stdout
+
+        # Check for PFL (multiple extent components)
+        entry_count_m = re.search(r"lcm_entry_count:\s*(\d+)", out)
+        if entry_count_m and int(entry_count_m.group(1)) > 1:
+            return _parse_pfl(out)
+
+        # Simple (single-component) layout
+        info = {"pfl": False}
+        m = re.search(r"stripe_count:\s*(-?\d+)", out)
+        info["stripe_count"] = int(m.group(1)) if m else None
+
+        m = re.search(r"stripe_size:\s*(\d+)", out)
+        info["stripe_size"] = int(m.group(1)) if m else None
+
+        m = re.search(r"pool:\s*(\S+)", out)
+        info["ost_pool"] = m.group(1) if m else None
+
+        return info
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+
+
+def _parse_pfl(out):
+    """Parse a Progressive File Layout from ``lfs getstripe -d`` output."""
+    components = []
+    # Split on lcme_extent blocks
+    for block in re.split(r"lcme_id:", out)[1:]:
+        comp = {}
+        m = re.search(r"lcme_extent\.e_start:\s*(\d+)", block)
+        comp["start"] = int(m.group(1)) if m else 0
+
+        m = re.search(r"lcme_extent\.e_end:\s*(\w+)", block)
+        comp["end"] = m.group(1) if m else "EOF"
+        if comp["end"] != "EOF":
+            comp["end"] = int(comp["end"])
+
+        m = re.search(r"stripe_count:\s*(-?\d+)", block)
+        comp["stripe_count"] = int(m.group(1)) if m else None
+
+        m = re.search(r"stripe_size:\s*(\d+)", block)
+        comp["stripe_size"] = int(m.group(1)) if m else None
+
+        components.append(comp)
+
+    info = {
+        "pfl": True,
+        "components": components,
+        # Expose first component values for simple access
+        "stripe_count": components[0]["stripe_count"] if components else None,
+        "stripe_size": components[0]["stripe_size"] if components else None,
+        "ost_pool": None,
+    }
+    m = re.search(r"pool:\s*(\S+)", out)
+    if m:
+        info["ost_pool"] = m.group(1)
+    return info
+
+
+def set_lustre_stripe(path, count=None, size=None):
+    """Apply Lustre stripe settings to a directory via ``lfs setstripe``.
+
+    *count* is the stripe count (``-1`` for filesystem default).
+    *size* is a human-readable stripe size string accepted by ``lfs``
+    (e.g. ``"1m"``, ``"4m"``, ``"16m"``).
+
+    Returns True on success, False on failure or non-Lustre.
+    """
+    cmd = ["lfs", "setstripe"]
+    if count is not None:
+        cmd += ["-c", str(count)]
+    if size is not None:
+        cmd += ["-S", str(size)]
+    cmd.append(str(path))
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        return result.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+def _fmt_bytes(n):
+    """Format a byte count as a compact human-readable string."""
+    if n is None:
+        return "?"
+    if n >= 1024 * 1024 and n % (1024 * 1024) == 0:
+        return f"{n // (1024 * 1024)}M"
+    if n >= 1024 and n % 1024 == 0:
+        return f"{n // 1024}K"
+    return str(n)
+
+
+def _fmt_end(v):
+    """Format a PFL extent end value."""
+    if v == "EOF":
+        return "EOF"
+    return _fmt_bytes(v)
+
+
+def format_stripe_info(info):
+    """Return a human-readable string for stripe info dict (or 'N/A')."""
+    if info is None:
+        return "N/A (not on Lustre)"
+
+    if info.get("pfl") and info.get("components"):
+        parts = []
+        for c in info["components"]:
+            sc = c.get("stripe_count", "?")
+            ss = _fmt_bytes(c.get("stripe_size"))
+            end = _fmt_end(c.get("end"))
+            parts.append(f"{sc}x{ss} to {end}")
+        desc = "PFL [" + " | ".join(parts) + "]"
+        if info.get("ost_pool"):
+            desc += f" pool={info['ost_pool']}"
+        return desc
+
+    parts = []
+    if info.get("stripe_count") is not None:
+        parts.append(f"count={info['stripe_count']}")
+    if info.get("stripe_size") is not None:
+        parts.append(f"size={_fmt_bytes(info['stripe_size'])}")
+    if info.get("ost_pool"):
+        parts.append(f"pool={info['ost_pool']}")
+    return ", ".join(parts) if parts else "N/A"
 
 
 def init_ranks():

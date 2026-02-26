@@ -39,6 +39,8 @@ from benchmarks.utils import (
     init_dataloader_csv_log,
     log_dataloader_csv_result,
     print_dataloader_table,
+    get_lustre_stripe_info,
+    format_stripe_info,
 )
 
 
@@ -202,6 +204,7 @@ def run(backend, batch_sizes, num_workers_list, prefetch_factors,
     data = store["data"]
     num_samples, lon, lat, num_levels = data.shape
     sample_bytes = lon * lat * num_levels * 4
+    stripe_info = get_lustre_stripe_info(zarr_path)
 
     if world_rank == 0:
         print(f"Zarr Store       : {zarr_path}")
@@ -209,14 +212,17 @@ def run(backend, batch_sizes, num_workers_list, prefetch_factors,
         print(f"Sample Shape     : ({lon}, {lat}, {num_levels})  "
               f"[lon × lat × levels]")
         print(f"Sample Size      : {sample_bytes / (1024**2):.1f} MB (float32)")
+        print(f"Lustre Stripe    : {format_stripe_info(stripe_info)}")
         print(f"Batch Sizes      : {batch_sizes}")
         print(f"Num Workers      : {num_workers_list}")
         print(f"Prefetch Factors : {prefetch_factors}")
         print("=" * 60)
         if output:
+            stripe_str = format_stripe_info(stripe_info)
             init_dataloader_csv_log(
                 output, backend, world_size, warmup, iters,
                 f"zarr={zarr_path}, shape=({lon},{lat},{num_levels}), "
+                f"lustre_stripe=({stripe_str}), "
                 f"batch_sizes={batch_sizes}, num_workers={num_workers_list}, "
                 f"prefetch_factor={prefetch_factors}")
 
