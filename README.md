@@ -79,6 +79,29 @@ results/                              # benchmark output files (CSV format)
 * NCCL (bundled with PyTorch CUDA builds)
 * A multi-GPU machine **or** a multi-node allocation
 
+# With Cray MPICH (e.g. on Derecho)
+  ml conda 
+  conda activate torch-
+  mpiexec -np 4 --cpu-bind none python -m benchmarks.run_all --backend nccl --table
+
+  # With OpenMPI
+  mpirun -np 4 python -m benchmarks.run_all --backend nccl --table
+
+  Run individual collectives
+
+  torchrun --nproc_per_node=4 -m benchmarks.collectives.all_reduce --backend nccl
+  --table
+  torchrun --nproc_per_node=4 -m benchmarks.collectives.all_gather --backend nccl
+  --table
+  torchrun --nproc_per_node=4 -m benchmarks.collectives.broadcast --backend nccl
+  --table
+  torchrun --nproc_per_node=4 -m benchmarks.collectives.reduce_scatter --backend nccl
+  --table
+  torchrun --nproc_per_node=4 -m benchmarks.collectives.point_to_point --backend nccl
+  --table
+
+
+
 ### Dataloader benchmarks
 
 ```bash
@@ -273,3 +296,61 @@ The benchmarks automatically detect ranks from whichever launcher you use:
 | `mpi4py` available | Uses `MPI.COMM_WORLD` directly |
 
 No code changes are needed when switching launchers.
+
+
+```
+algbw (Algorithm Bandwidth)                                                         
+   
+  - Simple formula: algbw = S / t (data size / time)                                  
+  - Measures the effective throughput of the entire operation
+  - Useful for estimating how long a given operation will take
+  - Problem: For collectives, this number decreases as you add more ranks, even if the
+   hardware is fully utilized. This makes it misleading for evaluating hardware
+  efficiency.
+
+  busbw (Bus Bandwidth)
+
+  - Applies a correction factor to algbw to account for the fact that collectives
+  inherently move more data as ranks increase
+  - Reflects how well the hardware (NVLink, PCIe, network) is being utilized
+  - Independent of the number of ranks, so you can directly compare it to the
+  theoretical peak bandwidth of your interconnect
+
+  Correction Factors
+
+  The formula is busbw = algbw * factor, where the factor depends on the collective
+  and n = number of ranks:
+  ┌───────────────┬───────────┐
+  │  Collective   │  Factor   │
+  ├───────────────┼───────────┤
+  │ AllReduce     │ 2*(n-1)/n │
+  ├───────────────┼───────────┤
+  │ ReduceScatter │ (n-1)/n   │
+  ├───────────────┼───────────┤
+  │ AllGather     │ (n-1)/n   │
+  ├───────────────┼───────────┤
+  │ Broadcast     │ 1         │
+  ├───────────────┼───────────┤
+  │ Reduce        │ 1         │
+  ├───────────────┼───────────┤
+  │ AlltoAll      │ (n-1)/n   │
+  └───────────────┴───────────┘
+  Practical Takeaway
+
+  - Use algbw to predict wall-clock time for a given message size: time = size / algbw
+  - Use busbw to evaluate whether your interconnect is performing at its peak — e.g.,
+  compare it against your NVLink or InfiniBand spec bandwidth
+
+  For example, with 8 GPUs doing AllReduce, busbw = algbw * 2*7/8 = algbw * 1.75. If
+  your NVLink bandwidth is 900 GB/s and you see busbw close to that, your hardware is
+  being used optimally.
+```
+
+  mpiexec -np 4 --cpu-bind none python -m benchmarks.dataloader.synthetic \
+      --zarr /glade/derecho/scratch/$USER/era5_bench.zarr \
+      --backend nccl --table \
+      --warmup 2 --iters 5 \
+      --batch_sizes 1 \
+      --num_workers 0 2 4 8 \
+      --prefetch_factor 2 \
+      --output results/zarr_sweep.csv
