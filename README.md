@@ -297,8 +297,6 @@ The benchmarks automatically detect ranks from whichever launcher you use:
 
 No code changes are needed when switching launchers.
 
-
-```
 algbw (Algorithm Bandwidth)                                                         
    
   - Simple formula: algbw = S / t (data size / time)                                  
@@ -320,6 +318,8 @@ algbw (Algorithm Bandwidth)
 
   The formula is busbw = algbw * factor, where the factor depends on the collective
   and n = number of ranks:
+
+```
   ┌───────────────┬───────────┐
   │  Collective   │  Factor   │
   ├───────────────┼───────────┤
@@ -335,6 +335,9 @@ algbw (Algorithm Bandwidth)
   ├───────────────┼───────────┤
   │ AlltoAll      │ (n-1)/n   │
   └───────────────┴───────────┘
+
+```
+
   Practical Takeaway
 
   - Use algbw to predict wall-clock time for a given message size: time = size / algbw
@@ -344,8 +347,8 @@ algbw (Algorithm Bandwidth)
   For example, with 8 GPUs doing AllReduce, busbw = algbw * 2*7/8 = algbw * 1.75. If
   your NVLink bandwidth is 900 GB/s and you see busbw close to that, your hardware is
   being used optimally.
-```
 
+```bash
   mpiexec -np 4 --cpu-bind none python -m benchmarks.dataloader.synthetic \
       --zarr /glade/derecho/scratch/$USER/era5_bench.zarr \
       --backend nccl --table \
@@ -354,3 +357,5 @@ algbw (Algorithm Bandwidth)
       --num_workers 0 2 4 8 \
       --prefetch_factor 2 \
       --output results/zarr_sweep.csv
+
+```
